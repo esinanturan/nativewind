@@ -1,14 +1,16 @@
-import connect from "connect";
-import fs from "fs/promises";
+import fs from "fs";
+import fsPromise from "fs/promises";
 import path from "path";
+
+import connect from "connect";
 import { debug as debugFn, Debugger } from "debug";
 import type { MetroConfig } from "metro-config";
-import type MetroServer from "metro/src/Server";
 import type { FileSystem } from "metro-file-map";
+import type MetroServer from "metro/src/Server";
 
-import { expoColorSchemeWarning } from "./expo";
-import { CssToReactNativeRuntimeOptions } from "../types";
 import { cssToReactNativeRuntime } from "../css-to-rn";
+import { CssToReactNativeRuntimeOptions } from "../types";
+import { expoColorSchemeWarning } from "./expo";
 
 /**
  * Injects the CSS into the React Native runtime.
@@ -25,23 +27,32 @@ import { cssToReactNativeRuntime } from "../css-to-rn";
  *  swap to a .js file generated in the node_modules
  *
  * ------------------
- * Notes about CLIs
+ * Notes
  * ------------------
  *
- * Metro has two run modes, normal (with a server) and headless. In headless mode the `enhancedMiddleware` is not called.
- * THIS DOES NOT MEAN THAT FAST-REFRESH IS NOT ENABLED! It just means you are making a build that CAN connect to an instance
- * of Metro that is running a server. E.g `eas` may do a development build that you download and connect to your local server
+ * - The virtual module setup requires the development server, so when its turned off we need to write styles to disk
+ * - Metro has two run modes, normal (with a server) and headless. In headless mode the `enhancedMiddleware` is not called.
+ *   THIS DOES NOT MEAN THAT FAST-REFRESH IS NOT ENABLED! It just means you are making a build that CAN connect to an instance
+ *   of Metro that is running a server. E.g `eas` may do a development build that you download and connect to your local server
+ * - You can also do production builds WITH Fast Refresh `npx expo run:android --variant production` will start a production
+ *   like build, but still enable the dev server for fast refresh.
+ * - RadonIDE doesn't use the virtual module setup, it writes the style changes to disk
+ * - expo-updates starts its own Metro server with weird timing issues that we cannot resolve. This is why we always write to disk in production.
  *
- * You can also do production builds WITH Fast Refresh `npx expo run:android --variant production` will start a production
- * like build, but still enable the dev server for fast refresh, it just don't use it.
+ * ------------------
+ * Different build types
+ * ------------------
+ * Each of these commands will trigger a different build type.
  *
- * The virtual module setup requires the development server, so when its turned off we need to write styles to disk
- *
- * Therefore there are two flags
- * - isDev: Is this a development or production build
- * - writeStyles: Is this a headless build where we need to write styles to disk
- *
- * All combinations over these flags at used in various scenarios
+ *  - `expo start`
+ *  - `expo run <platform> --variant production|development`
+ *  - `expo export`
+ *  - `eas build (without expo-updates)`
+ *  - `eas build (with expo-updates)`
+ *  - `react-native run`
+ *  - `react-native build`
+ *  - `npx expo prebuild & building in xcode (development)`
+ *  - `npx expo prebuild & building in xcode (production)`
  */
 
 export type WithCssInteropOptions = CssToReactNativeRuntimeOptions & {
@@ -63,7 +74,7 @@ export type GetCSSForPlatform = (
 export type GetCSSForPlatformOnChange = (platform: string) => void;
 
 let haste: any;
-let writeStyles = true;
+let virtualModulesPossible: undefined | Promise<void> = undefined;
 const virtualModules = new Map<string, Promise<string | Buffer>>();
 const outputDirectory = path.resolve(__dirname, "../../.cache");
 const isRadonIDE = "REACT_NATIVE_IDE_LIB_PATH" in process.env;
@@ -105,6 +116,13 @@ function getConfig(
   // Used by the resolverPoisonPill
   const poisonPillPath = "./interop-poison.pill";
 
+  fs.mkdirSync(outputDirectory, { recursive: true });
+  fs.writeFileSync(platformPath("ios"), "");
+  fs.writeFileSync(platformPath("android"), "");
+  fs.writeFileSync(platformPath("native"), "");
+  fs.writeFileSync(platformPath("macos"), "");
+  fs.writeFileSync(platformPath("windows"), "");
+
   return {
     ...config,
     transformerPath: require.resolve("./transformer"),
@@ -122,20 +140,36 @@ function getConfig(
         transformOptions,
         getDependenciesOf,
       ) {
-        // We need to write the styles to the file system if we're either building for production, or
-        // we're building a standalone client and the watcher isn't enabled
         debug(`getTransformOptions.dev ${transformOptions.dev}`);
-        debug(`getTransformOptions.watching ${writeStyles}`);
-        debug(`getTransformOptions.writeStyles ${writeStyles}`);
+        debug(`getTransformOptions.platform ${transformOptions.platform}`);
+        debug(
+          `getTransformOptions.virtualModulesPossible ${Boolean(virtualModulesPossible)}`,
+        );
 
-        // We can skip writing to the filesystem if this instance patched Metro
-        if (writeStyles) {
-          const platform = transformOptions.platform || "native";
-          const filePath = platformPath(platform);
+        const platform = transformOptions.platform || "native";
+        const filePath = platformPath(platform);
 
+        if (virtualModulesPossible) {
+          await virtualModulesPossible;
+          await startCSSProcessor(
+            filePath,
+            platform,
+            transformOptions.dev,
+            options,
+            debug,
+          );
+        }
+
+        // We need to write to the file system if virtual modules are not possible and/or we are building for production
+        const writeToFileSystem =
+          !virtualModulesPossible || !transformOptions.dev;
+
+        debug(`getTransformOptions.writeToFileSystem ${writeToFileSystem}`);
+
+        if (writeToFileSystem) {
           debug(`getTransformOptions.output ${filePath}`);
 
-          // Virtual modules don't work for RadonIDE, so we need to write to the filesystem on changes
+          // Radon IDE needs to watch the file system for changes, so we need to write the file
           const watchFn = isRadonIDE
             ? async (css: string) => {
                 const output =
@@ -146,7 +180,7 @@ function getConfig(
                         debug,
                       );
 
-                await fs.writeFile(filePath, output);
+                await fsPromise.writeFile(filePath, output);
               }
             : undefined;
 
@@ -160,9 +194,13 @@ function getConfig(
                   debug,
                 );
 
-          await fs.mkdir(outputDirectory, { recursive: true });
-          await fs.writeFile(filePath, output);
-          await fs.writeFile(filePath.replace(/\.js$/, ".map"), "");
+          await fsPromise.mkdir(outputDirectory, { recursive: true });
+          await fsPromise.writeFile(filePath, output);
+          if (platform !== "web") {
+            await fsPromise.writeFile(filePath.replace(/\.js$/, ".map"), "");
+          }
+
+          debug(`getTransformOptions.finished`);
         }
 
         return Object.assign(
@@ -185,25 +223,21 @@ function getConfig(
         if (options.forceWriteFileSystem) {
           debug(`forceWriteFileSystem true`);
         } else {
-          const initPromise = bundler
-            .getDependencyGraph()
-            .then(async (graph: any) => {
-              haste = graph._haste;
-              ensureFileSystemPatched(graph._fileSystem);
-              ensureBundlerPatched(bundler);
-            });
-
-          // If we patch Metro, we don't need to write the styles
-          // The exception to this is Radon IDE, which will launch the dev server and then kill it
           if (!isRadonIDE) {
-            writeStyles = false;
-          }
+            virtualModulesPossible = bundler
+              .getDependencyGraph()
+              .then(async (graph: any) => {
+                haste = graph._haste;
+                ensureFileSystemPatched(graph._fileSystem);
+                ensureBundlerPatched(bundler);
+              });
 
-          server.use(async (_, __, next) => {
-            // Wait until the bundler patching has completed
-            await initPromise;
-            next();
-          });
+            server.use(async (_, __, next) => {
+              // Wait until the bundler patching has completed
+              await virtualModulesPossible;
+              next();
+            });
+          }
         }
 
         return originalMiddleware
@@ -228,15 +262,20 @@ function getConfig(
         }
 
         platform = platform || "native";
-        // Generate a fake name for our virtual module. Make it platform specific
 
+        // Generate a fake name for our virtual module. Make it platform specific
         const filePath = platformPath(platform);
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const development = (context as any).isDev || (context as any).dev;
+        const isWebProduction = !development && platform === "web";
 
         debug(`resolveRequest.input ${resolved.filePath}`);
         debug(`resolveRequest.resolvedTo: ${filePath}`);
-        if (!writeStyles) {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const development = (context as any).isDev || (context as any).dev;
+        debug(`resolveRequest.development: ${development}`);
+        debug(`resolveRequest.platform: ${platform}`);
+
+        if (virtualModulesPossible && !isWebProduction) {
           startCSSProcessor(filePath, platform, development, options, debug);
         }
 
@@ -280,7 +319,9 @@ async function startCSSProcessor(
     virtualModules.set(
       filePath,
       getCSSForPlatform(platform).then((css) => {
-        return getNativeJS(cssToReactNativeRuntime(css, options), debug);
+        return platform === "web"
+          ? css
+          : getNativeJS(cssToReactNativeRuntime(css, options), debug);
       }),
     );
   } else {
